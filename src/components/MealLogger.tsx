@@ -21,21 +21,70 @@ export default function MealLogger({ userId, onClose, onLogged }: MealLoggerProp
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
+  const [converting, setConverting] = useState(false);
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const onDrop = useCallback((acceptedFiles: File[]) => {
-    const selectedFile = acceptedFiles[0];
+  const onDrop = useCallback(async (acceptedFiles: File[]) => {
+    let selectedFile = acceptedFiles[0];
+    console.log('File selected:', selectedFile); // Request Step 1
+    
     if (selectedFile) {
+      setError(null);
+
+      // Check if file is HEIC or HEIF
+      // Note: iOS sometimes auto-converts HEIC to JPEG on upload but keeps the .heic filename.
+      // If the type is already image/jpeg, we don't need to convert it.
+      const isHeic = (selectedFile.type === 'image/heic' || selectedFile.type === 'image/heif') || 
+                     ((!selectedFile.type || selectedFile.type === '') && 
+                      (selectedFile.name.toLowerCase().endsWith('.heic') || selectedFile.name.toLowerCase().endsWith('.heif')));
+
+      if (isHeic) {
+        try {
+          // Show loading state while converting
+          setConverting(true);
+          const heic2any = (await import('heic2any')).default;
+          const convertedBlob = await heic2any({
+            blob: selectedFile,
+            toType: 'image/jpeg',
+            quality: 0.8
+          });
+
+          // Replace file with converted JPEG blob
+          const blobArray = Array.isArray(convertedBlob) ? convertedBlob : [convertedBlob];
+          selectedFile = new File(blobArray, 'photo.jpg', { type: 'image/jpeg' });
+        } catch (err: any) {
+          console.error('HEIC conversion failed:', err);
+          // If the library throws ERR_LIBHEIF, the file likely isn't a valid HEIC file to begin with
+          // (e.g., iOS already converted it to JPEG before handing it to the browser).
+          // Fall back gracefully to using the original selectedFile instead of outright failing.
+          console.log('Falling back to direct file read...');
+        } finally {
+          setConverting(false);
+        }
+      }
+
       setFile(selectedFile);
-      setPreview(URL.createObjectURL(selectedFile));
+      
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const result = e.target?.result as string;
+        console.log('Base64 result:', result?.substring(0, 50)); // Request Step 2
+        setPreview(result);
+      };
+      reader.readAsDataURL(selectedFile);
+      
       setError(null);
     }
   }, []);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
-    accept: { 'image/*': [] },
+    accept: { 
+      'image/*': ['.jpeg', '.jpg', '.png', '.webp'],
+      'image/heic': ['.heic'],
+      'image/heif': ['.heif']
+    },
     multiple: false,
   } as any);
 
@@ -100,17 +149,73 @@ export default function MealLogger({ userId, onClose, onLogged }: MealLoggerProp
   };
 
   const confirmLog = async () => {
-    if (!result) return;
+    if (!result || !file) return;
 
     try {
-      await addDoc(collection(db, 'users', userId, 'meals'), {
+      console.log('File selected:', file);
+
+      // Compress the image safely reading directly from the File Blob
+      const compressImage = (): Promise<string> => {
+        return new Promise((resolve) => {
+          const reader = new FileReader();
+          reader.onload = (e) => {
+            const dataUrl = e.target?.result as string;
+            const img = new Image();
+            img.onload = () => {
+              const canvas = document.createElement('canvas');
+              canvas.width = 400;
+              canvas.height = 400;
+              const ctx = canvas.getContext('2d');
+              if (ctx) {
+                // Maintain aspect ratio while sizing to fill 400x400
+                const aspect = img.width / img.height;
+                let drawWidth, drawHeight, offsetX, offsetY;
+                if (aspect > 1) {
+                  drawHeight = 400;
+                  drawWidth = 400 * aspect;
+                  offsetX = -(drawWidth - 400) / 2;
+                  offsetY = 0;
+                } else {
+                  drawWidth = 400;
+                  drawHeight = 400 / aspect;
+                  offsetX = 0;
+                  offsetY = -(drawHeight - 400) / 2;
+                }
+                ctx.drawImage(img, offsetX, offsetY, drawWidth, drawHeight);
+                const compressed = canvas.toDataURL('image/jpeg', 0.7);
+                console.log('Base64 result:', compressed.substring(0, 50));
+                resolve(compressed);
+              } else {
+                resolve(dataUrl); // fallback
+              }
+            };
+            img.src = dataUrl;
+          };
+          reader.readAsDataURL(file);
+        });
+      };
+
+      const compressedBase64 = await compressImage();
+
+      const mealData = {
         ...result,
         timestamp: Timestamp.now(),
         createdAt: serverTimestamp(),
-        // Note: For a real app, you'd upload the file to Firebase Storage first and use the URL.
-        // For this demo, we can use a placeholder or local blob if desired.
-        imageUrl: preview, 
-      });
+        imageUrl: compressedBase64, // Saved persistently
+      };
+
+      await addDoc(collection(db, 'users', userId, 'meals'), mealData);
+      
+      console.log('Saved meal image data exists:', !!mealData.imageUrl);
+
+      try {
+        // Safe check for quota limits just in case
+        localStorage.setItem('test_quota', JSON.stringify({ test: 'data' }));
+        localStorage.removeItem('test_quota');
+      } catch(e) {
+        console.error('localStorage is FULL:', e);
+      }
+
       onLogged();
       onClose();
     } catch (err) {
@@ -147,20 +252,43 @@ export default function MealLogger({ userId, onClose, onLogged }: MealLoggerProp
                   isDragActive ? 'border-[#5A6E4B] bg-[#F1F3EE]' : 'border-[#E8E6E0] bg-[#F8F7F2] hover:border-[#5A6E4B] hover:bg-[#F1F3EE]'
                 }`}
               >
-                <input {...getInputProps()} />
-                <div className="flex h-20 w-20 items-center justify-center rounded-2xl bg-white shadow-sm ring-1 ring-[#E8E6E0] mb-6">
-                  <Camera className="h-10 w-10 text-[#5A6E4B]" />
-                </div>
-                <p className="text-xl font-bold text-[#2D2D2A]">Snap or Upload</p>
-                <p className="text-sm text-[#8E8D8A] mt-1">Gemini AI will identify your meal</p>
+                <input {...getInputProps({ capture: 'environment' })} />
+                
+                {converting ? (
+                  <div className="flex flex-col items-center justify-center space-y-4">
+                    <Loader2 className="h-10 w-10 animate-spin text-[#5A6E4B] stroke-[3]" />
+                    <p className="font-bold text-[#2D2D2A]">Converting iPhone photo...</p>
+                    <p className="text-xs text-[#8E8D8A]">This takes just a moment</p>
+                  </div>
+                ) : (
+                  <>
+                    <div className="flex h-20 w-20 items-center justify-center rounded-2xl bg-white shadow-sm ring-1 ring-[#E8E6E0] mb-6">
+                      <Camera className="h-10 w-10 text-[#5A6E4B]" />
+                    </div>
+                    <p className="text-xl font-bold text-[#2D2D2A]">Snap or Upload</p>
+                    <p className="text-sm text-[#8E8D8A] mt-1">Gemini AI will identify your meal</p>
+                  </>
+                )}
               </div>
             ) : (
               <div className="space-y-8">
-                <div className="relative aspect-square overflow-hidden rounded-[32px] group ring-1 ring-[#E8E6E0]">
-                  <img src={preview} className="h-full w-full object-cover transition-transform group-hover:scale-105 duration-700" />
+                <div className="relative w-full aspect-square min-h-[250px] overflow-hidden rounded-[32px] group ring-1 ring-[#E8E6E0] bg-[#F8F7F2]">
+                  <img 
+                    id="image-preview"
+                    src={preview} 
+                    alt="food"
+                    className="transition-transform group-hover:scale-105 duration-700" 
+                    style={{ 
+                      display: 'block', 
+                      width: '100%', 
+                      height: '100%', 
+                      objectFit: 'cover',
+                      borderRadius: '16px'
+                    }} 
+                  />
                   <Button
                     size="icon"
-                    className="absolute right-6 top-6 h-10 w-10 rounded-full bg-black/40 text-white backdrop-blur-lg hover:bg-black/60 transition-all"
+                    className="absolute right-6 top-6 h-10 w-10 rounded-full bg-black/40 text-white backdrop-blur-lg hover:bg-black/60 transition-all z-10"
                     onClick={() => { setFile(null); setPreview(null); setResult(null); }}
                   >
                     <X className="h-5 w-5" />

@@ -100,6 +100,7 @@ service cloud.firestore {
       allow create: if isOwner(userId) && isValidStepLog(incoming()) && incoming().createdAt == request.time;
       allow update: if isOwner(userId) && isValidStepLog(incoming())
         && incoming().diff(existing()).affectedKeys().hasOnly(['count', 'caloriesBurned', 'timestamp']);
+      allow delete: if isOwner(userId);
     }
   }
 }

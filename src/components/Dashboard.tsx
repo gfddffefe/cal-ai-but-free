@@ -1,17 +1,86 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { db, auth } from '../lib/firebase';
-import { collection, query, where, getDocs, orderBy, Timestamp, limit } from 'firebase/firestore';
+import { collection, query, where, getDocs, orderBy, Timestamp, limit, deleteDoc, doc } from 'firebase/firestore';
 import { UserProfile, Meal, Workout, StepLog } from '../types';
 import { Button } from './ui/button';
 import { Progress } from './ui/progress';
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card';
-import { Plus, Settings, History, Utensils, PieChart as PieChartIcon, Camera, Dumbbell, Footprints, TrendingUp, X, Menu, LogOut, ChevronRight } from 'lucide-react';
+import { Plus, Settings, History, Utensils, PieChart as PieChartIcon, Camera, Dumbbell, Footprints, TrendingUp, X, Menu, LogOut, ChevronRight, Trash2, Target } from 'lucide-react';
 import { format, startOfDay, addDays, subDays, isSameDay, startOfWeek, eachDayOfInterval } from 'date-fns';
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip as RechartsTooltip } from 'recharts';
 import MealLogger from './MealLogger';
 import WorkoutLogger from './WorkoutLogger';
 import StepTracker from './StepTracker';
-import { motion, AnimatePresence } from 'motion/react';
+import GoalEditor from './GoalEditor';
+import { motion, AnimatePresence, useAnimation, PanInfo } from 'motion/react';
+
+const SwipeToDeleteItem = ({ children, onDelete, isReadOnly }: { children: React.ReactNode, onDelete: () => void, isReadOnly: boolean }) => {
+  const controls = useAnimation();
+  const [showConfirm, setShowConfirm] = useState(false);
+
+  const handleDragEnd = (e: any, info: PanInfo) => {
+    if (isReadOnly) return;
+    if (info.offset.x < -60) {
+      controls.start({ x: -100 });
+    } else {
+      controls.start({ x: 0 });
+      setShowConfirm(false);
+    }
+  };
+
+  const handleDeleteClick = () => {
+    if (!showConfirm) {
+      setShowConfirm(true);
+      setTimeout(() => setShowConfirm(false), 3000);
+    } else {
+      onDelete();
+      setShowConfirm(false);
+      controls.start({ x: 0 });
+    }
+  };
+
+  return (
+    <div className="relative rounded-[24px] overflow-hidden w-full bg-[#E57373] group">
+      {!isReadOnly && (
+        <div className="absolute inset-y-0 right-0 flex items-center justify-end w-[100px] text-white">
+          <button 
+            onClick={handleDeleteClick} 
+            className="flex flex-col items-center justify-center w-full h-full gap-1"
+          >
+            <Trash2 className="h-5 w-5" />
+            {showConfirm && <span className="text-[10px] font-bold">Sure?</span>}
+          </button>
+        </div>
+      )}
+      <motion.div
+        drag={isReadOnly ? false : "x"}
+        dragConstraints={{ left: -100, right: 0 }}
+        dragElastic={0.1}
+        onDragEnd={handleDragEnd}
+        animate={controls}
+        className="relative bg-white w-full rounded-[24px] z-10"
+        style={{ touchAction: "pan-y" }}
+      >
+        <div className="flex items-center">
+          <div className="flex-1 min-w-0">
+             {children}
+          </div>
+          {!isReadOnly && (
+            <div className="hidden lg:flex items-center pr-4 absolute right-0 top-0 bottom-0 pointer-events-none">
+              <button 
+                onClick={handleDeleteClick}
+                className={`p-2 rounded-xl flex items-center gap-2 pointer-events-auto transition-colors ${showConfirm ? 'bg-[#E57373] text-white' : 'text-[#E57373] opacity-0 group-hover:opacity-100 hover:bg-red-50'}`}
+              >
+                <Trash2 className="h-5 w-5" />
+                {showConfirm && <span className="text-xs font-bold font-sans">Sure?</span>}
+              </button>
+            </div>
+          )}
+        </div>
+      </motion.div>
+    </div>
+  );
+};
 
 type ViewType = 'dashboard' | 'meals' | 'activities';
 
@@ -30,8 +99,21 @@ export default function Dashboard({ profile }: DashboardProps) {
   const [showLogger, setShowLogger] = useState(false);
   const [showWorkoutLogger, setShowWorkoutLogger] = useState(false);
   const [showStepTracker, setShowStepTracker] = useState(false);
+  const [showGoalEditor, setShowGoalEditor] = useState(false);
+  const [confirmClearSteps, setConfirmClearSteps] = useState(false);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [loading, setLoading] = useState(true);
+
+  const [userGoal, setUserGoal] = useState({
+    calories: profile.dailyCalorieGoal || 2000,
+    macros: {
+      protein: Math.round((profile.dailyCalorieGoal * 0.3) / 4),
+      carbs: Math.round((profile.dailyCalorieGoal * 0.4) / 4),
+      fats: Math.round((profile.dailyCalorieGoal * 0.3) / 9)
+    },
+    info: { ...profile }
+  });
+
   const scrollRef = useRef<HTMLDivElement>(null);
   const todayRef = useRef<HTMLButtonElement>(null);
 
@@ -158,10 +240,68 @@ export default function Dashboard({ profile }: DashboardProps) {
   const totalBurned = workoutBurn + stepsBurn;
 
   const netCalories = mealStats.calories - totalBurned;
-  const isOverGoal = netCalories > profile.dailyCalorieGoal;
-  const remainingCals = profile.dailyCalorieGoal - netCalories;
+  const isOverGoal = netCalories > userGoal.calories;
+  const remainingCals = userGoal.calories - netCalories;
   
-  const progressValue = Math.min((netCalories / profile.dailyCalorieGoal) * 100, 100);
+  const progressValue = Math.min((netCalories / userGoal.calories) * 100, 100);
+
+  const deleteMeal = async (mealId: string) => {
+    try {
+      await deleteDoc(doc(db, 'users', profile.userId, 'meals', mealId));
+      const newMeals = meals.filter(m => m.id !== mealId);
+      setMeals(newMeals);
+      const dateKey = format(selectedDate, 'yyyy-MM-dd');
+      const cached = localStorage.getItem(`data_${dateKey}`);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        parsed.meals = newMeals;
+        parsed.summary.calories = newMeals.reduce((s: number, m: Meal) => s + m.calories, 0);
+        localStorage.setItem(`data_${dateKey}`, JSON.stringify(parsed));
+      }
+    } catch (e) {
+      console.error('Error deleting meal:', e);
+    }
+  };
+
+  const deleteWorkout = async (workoutId: string) => {
+    try {
+      await deleteDoc(doc(db, 'users', profile.userId, 'workouts', workoutId));
+      const newWorkouts = workouts.filter(w => w.id !== workoutId);
+      setWorkouts(newWorkouts);
+      const dateKey = format(selectedDate, 'yyyy-MM-dd');
+      const cached = localStorage.getItem(`data_${dateKey}`);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        parsed.workouts = newWorkouts;
+        const newBurn = newWorkouts.reduce((s: number, w: Workout) => s + w.caloriesBurned, 0) + (steps?.caloriesBurned || 0);
+        parsed.summary.burned = newBurn;
+        localStorage.setItem(`data_${dateKey}`, JSON.stringify(parsed));
+      }
+    } catch (e) {
+      console.error('Error deleting workout:', e);
+    }
+  };
+
+  const clearSteps = async () => {
+    if (!steps || isPastDay) return;
+
+    try {
+      if (steps.id) {
+        await deleteDoc(doc(db, 'users', profile.userId, 'steps', steps.id));
+      }
+      setSteps(null);
+      const dateKey = format(selectedDate, 'yyyy-MM-dd');
+      const cached = localStorage.getItem(`data_${dateKey}`);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        parsed.steps = null;
+        parsed.summary.burned = workouts.reduce((sum, w) => sum + w.caloriesBurned, 0);
+        localStorage.setItem(`data_${dateKey}`, JSON.stringify(parsed));
+      }
+    } catch (e) {
+      console.error('Error clearing steps:', e);
+    }
+  };
 
   return (
     <div className="flex min-h-screen bg-[#F8F7F2] font-sans text-[#2D2D2A] overflow-x-hidden">
@@ -208,6 +348,14 @@ export default function Dashboard({ profile }: DashboardProps) {
               <p className="text-xs text-[#8E8D8A]">Premium Account</p>
             </div>
           </div>
+          <Button 
+            variant="ghost" 
+            className="w-full justify-start gap-3 rounded-xl px-4 py-3 font-medium text-[#8E8D8A] hover:bg-[#F8F7F2] hover:text-[#5A6E4B] mb-2"
+            onClick={() => setShowGoalEditor(true)}
+          >
+            <Target className="h-5 w-5" />
+            My Goal
+          </Button>
           <Button 
             variant="ghost" 
             className="w-full justify-start gap-3 rounded-xl px-4 py-3 font-medium text-[#8E8D8A] hover:text-[#E57373] hover:bg-red-50"
@@ -325,11 +473,12 @@ export default function Dashboard({ profile }: DashboardProps) {
                           className="transition-all duration-1000 ease-out"
                         />
                       </svg>
-                      <div className="text-center z-10">
+                      <div className="text-center z-10 flex flex-col items-center">
                         <p className={`text-6xl font-bold ${isOverGoal ? 'text-[#E57373]' : 'text-[#2D2D2A]'}`}>
                           {Math.max(0, remainingCals).toLocaleString()}
                         </p>
-                        <p className="text-xs font-black uppercase tracking-[0.2em] text-[#8E8D8A] mt-1">Kcal Left</p>
+                        <p className="text-xs font-black uppercase tracking-[0.2em] text-[#8E8D8A] mt-1 mb-2">Kcal Left</p>
+                        <p className="text-[10px] font-bold text-[#8E8D8A] bg-[#F1F3EE] px-3 py-1 rounded-full uppercase tracking-wider">{netCalories} / {userGoal.calories} kcal</p>
                       </div>
                     </div>
 
@@ -345,19 +494,21 @@ export default function Dashboard({ profile }: DashboardProps) {
                       <div className="col-span-2 p-8 lg:p-10 rounded-[40px] bg-[#2D2D2A] text-white overflow-hidden shadow-2xl">
                         <div className="flex justify-between items-center mb-6">
                           <p className="text-xs font-black uppercase tracking-[0.2em] opacity-60">Daily Macros</p>
-                          <PieChartIcon className="h-5 w-5 opacity-40" />
+                          <button onClick={() => setShowGoalEditor(true)} className="text-[10px] font-bold uppercase tracking-wider bg-white/10 px-3 py-1.5 rounded-full hover:bg-white/20 transition-colors cursor-pointer flex items-center gap-1">
+                            <Target className="h-3 w-3" /> Edit Goal
+                          </button>
                         </div>
                         <div className="space-y-6">
                           {/* Protein */}
                           <div className="space-y-2">
                             <div className="flex justify-between text-[11px] font-black uppercase tracking-widest">
                               <span className="text-[#E57373]">Protein</span>
-                              <span>{mealStats.protein}g / {Math.round(profile.dailyCalorieGoal * 0.3 / 4)}g</span>
+                              <span>{mealStats.protein}g / {userGoal.macros.protein}g</span>
                             </div>
                             <div className="h-3 w-full rounded-full bg-white/10 overflow-hidden">
                               <motion.div 
                                 initial={{ width: 0 }}
-                                animate={{ width: `${Math.min((mealStats.protein / (profile.dailyCalorieGoal * 0.3 / 4)) * 100, 100)}%` }}
+                                animate={{ width: `${Math.min((mealStats.protein / userGoal.macros.protein) * 100, 100)}%` }}
                                 className="h-full bg-[#E57373]" 
                               />
                             </div>
@@ -366,12 +517,12 @@ export default function Dashboard({ profile }: DashboardProps) {
                           <div className="space-y-2">
                             <div className="flex justify-between text-[11px] font-black uppercase tracking-widest">
                               <span className="text-[#81C784]">Carbs</span>
-                              <span>{mealStats.carbs}g / {Math.round(profile.dailyCalorieGoal * 0.4 / 4)}g</span>
+                              <span>{mealStats.carbs}g / {userGoal.macros.carbs}g</span>
                             </div>
                             <div className="h-3 w-full rounded-full bg-white/10 overflow-hidden">
                               <motion.div 
                                 initial={{ width: 0 }}
-                                animate={{ width: `${Math.min((mealStats.carbs / (profile.dailyCalorieGoal * 0.4 / 4)) * 100, 100)}%` }}
+                                animate={{ width: `${Math.min((mealStats.carbs / userGoal.macros.carbs) * 100, 100)}%` }}
                                 className="h-full bg-[#81C784]" 
                               />
                             </div>
@@ -380,12 +531,12 @@ export default function Dashboard({ profile }: DashboardProps) {
                           <div className="space-y-2">
                             <div className="flex justify-between text-[11px] font-black uppercase tracking-widest">
                               <span className="text-[#FFB74D]">Fats</span>
-                              <span>{mealStats.fats}g / {Math.round(profile.dailyCalorieGoal * 0.3 / 9)}g</span>
+                              <span>{mealStats.fats}g / {userGoal.macros.fats}g</span>
                             </div>
                             <div className="h-3 w-full rounded-full bg-white/10 overflow-hidden">
                               <motion.div 
                                 initial={{ width: 0 }}
-                                animate={{ width: `${Math.min((mealStats.fats / (profile.dailyCalorieGoal * 0.3 / 9)) * 100, 100)}%` }}
+                                animate={{ width: `${Math.min((mealStats.fats / userGoal.macros.fats) * 100, 100)}%` }}
                                 className="h-full bg-[#FFB74D]" 
                               />
                             </div>
@@ -430,9 +581,29 @@ export default function Dashboard({ profile }: DashboardProps) {
                       <p className="text-xs font-black uppercase tracking-widest text-[#8E8D8A]">Steps</p>
                       <p className="text-2xl font-bold">{steps?.count || 0} <span className="text-sm font-normal opacity-50">steps</span></p>
                     </div>
-                    <div className="text-right">
-                      <p className="text-sm font-bold text-[#5A6E4B]">+{stepsBurn.toFixed(1)}</p>
-                      <p className="text-[10px] text-[#8E8D8A]">kcal burned</p>
+                    <div className="text-right flex items-center justify-end gap-2">
+                      <div className="text-right">
+                        <p className="text-sm font-bold text-[#5A6E4B]">+{stepsBurn.toFixed(1)}</p>
+                        <p className="text-[10px] text-[#8E8D8A]">kcal burned</p>
+                      </div>
+                      {steps && !isPastDay && (
+                        <button 
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (!confirmClearSteps) {
+                              setConfirmClearSteps(true);
+                              setTimeout(() => setConfirmClearSteps(false), 3000);
+                            } else {
+                              clearSteps();
+                              setConfirmClearSteps(false);
+                            }
+                          }}
+                          className={`p-2 rounded-xl transition-colors flex items-center gap-1 ${confirmClearSteps ? 'bg-[#E57373] text-white' : 'text-[#E57373] hover:bg-red-50'}`}
+                        >
+                          <Trash2 className="h-4 w-4" />
+                          {confirmClearSteps && <span className="text-[10px] font-bold">Sure?</span>}
+                        </button>
+                      )}
                     </div>
                   </Card>
 
@@ -463,15 +634,19 @@ export default function Dashboard({ profile }: DashboardProps) {
                     </h3>
                     <div className="space-y-4">
                       {workouts.map((w) => (
-                        <div key={w.id} className="flex items-center gap-4 p-4 rounded-2xl bg-[#F8F7F2] border border-[#E8E6E0]/50">
-                          <div className="h-10 w-10 rounded-xl bg-white flex items-center justify-center shrink-0">
-                            <Dumbbell className="h-5 w-5 text-[#5A6E4B]" />
-                          </div>
-                          <div className="flex-1 min-w-0">
-                            <p className="font-bold text-sm truncate">{w.type}</p>
-                            <p className="text-[10px] text-[#8E8D8A] uppercase font-bold">{w.duration} min • {w.intensity}</p>
-                          </div>
-                          <p className="font-bold text-[#5A6E4B] shrink-0">-{w.caloriesBurned}</p>
+                        <div key={w.id}>
+                          <SwipeToDeleteItem isReadOnly={isPastDay} onDelete={() => deleteWorkout(w.id)}>
+                            <div className="flex items-center gap-4 p-4 rounded-2xl bg-[#F8F7F2] border border-[#E8E6E0]/50">
+                              <div className="h-10 w-10 rounded-xl bg-white flex items-center justify-center shrink-0">
+                                <Dumbbell className="h-5 w-5 text-[#5A6E4B]" />
+                              </div>
+                              <div className="flex-1 min-w-0">
+                                <p className="font-bold text-sm truncate">{w.type}</p>
+                                <p className="text-[10px] text-[#8E8D8A] uppercase font-bold">{w.duration} min • {w.intensity}</p>
+                              </div>
+                              <p className="font-bold text-[#5A6E4B] shrink-0">-{w.caloriesBurned}</p>
+                            </div>
+                          </SwipeToDeleteItem>
                         </div>
                       ))}
                     </div>
@@ -491,30 +666,37 @@ export default function Dashboard({ profile }: DashboardProps) {
                         <p className="text-sm">No meals logged for this day</p>
                       </div>
                     ) : (
-                      meals.map((meal) => (
-                        <div key={meal.id} className="flex items-center gap-4 group cursor-pointer">
-                          <div className="h-14 w-14 rounded-2xl bg-[#F1F3EE] flex items-center justify-center shrink-0 overflow-hidden relative border border-[#E8E6E0]/50">
-                            {meal.imageUrl ? (
-                              <img src={meal.imageUrl} className="h-full w-full object-cover" referrerPolicy="no-referrer" />
-                            ) : (
-                              <Utensils className="h-6 w-6 text-[#8E8D8A]" />
-                            )}
-                            <span className="absolute bottom-0 right-0 text-[8px] bg-[#5A6E4B] text-white px-1 leading-tight font-black">AI</span>
-                          </div>
-                          <div className="flex-1 min-w-0">
-                            <p className="font-bold text-sm truncate group-hover:text-[#5A6E4B] transition-colors">{meal.name}</p>
-                            <p className="text-xs text-[#8E8D8A]">{format(ensureDate(meal.timestamp), 'h:mm a')}</p>
-                          </div>
-                          <div className="text-right shrink-0">
-                            <p className="font-bold text-sm">{meal.calories} kcal</p>
-                            <div className="flex gap-1 mt-1">
-                              <div className="h-1 w-3 rounded-full bg-[#E57373]" />
-                              <div className="h-1 w-3 rounded-full bg-[#81C784]" />
-                              <div className="h-1 w-3 rounded-full bg-[#FFB74D]" />
+                      meals.map((meal) => {
+                        console.log(`Meal rendering - [${meal.name}] image check:`, meal.imageUrl ? meal.imageUrl.substring(0, 50) + '...' : 'undefined');
+                        return (
+                        <div key={meal.id}>
+                          <SwipeToDeleteItem isReadOnly={isPastDay} onDelete={() => deleteMeal(meal.id)}>
+                            <div className="flex items-center gap-4 group cursor-pointer bg-white">
+                               <div className="h-[60px] w-[60px] rounded-2xl bg-[#F1F3EE] flex items-center justify-center shrink-0 overflow-hidden relative border border-[#E8E6E0]/50">
+                                {meal.imageUrl ? (
+                                  <img src={meal.imageUrl} className="h-full w-full object-cover" referrerPolicy="no-referrer" />
+                                ) : (
+                                  <Utensils className="h-6 w-6 text-[#8E8D8A]" />
+                                )}
+                                <span className="absolute bottom-0 right-0 text-[8px] bg-[#5A6E4B] text-white px-1 leading-tight font-black">AI</span>
+                              </div>
+                              <div className="flex-1 min-w-0">
+                                <p className="font-bold text-sm truncate group-hover:text-[#5A6E4B] transition-colors">{meal.name}</p>
+                                <p className="text-xs text-[#8E8D8A]">{format(ensureDate(meal.timestamp), 'h:mm a')}</p>
+                              </div>
+                              <div className="text-right shrink-0 pr-2 lg:pr-14">
+                                <p className="font-bold text-sm">{meal.calories} kcal</p>
+                                <div className="flex gap-1 mt-1 justify-end">
+                                  <div className="h-1 w-3 rounded-full bg-[#E57373]" />
+                                  <div className="h-1 w-3 rounded-full bg-[#81C784]" />
+                                  <div className="h-1 w-3 rounded-full bg-[#FFB74D]" />
+                                </div>
+                              </div>
                             </div>
-                          </div>
+                          </SwipeToDeleteItem>
                         </div>
-                      ))
+                        );
+                      })
                     )}
                   </div>
                 </Card>
@@ -541,16 +723,20 @@ export default function Dashboard({ profile }: DashboardProps) {
                  {/* Meals history content would go here, for now using a placeholder filter or message */}
                  <p className="text-[#8E8D8A]">Viewing all logged meals in chronological order...</p>
                  {meals.map(m => (
-                   <Card key={m.id} className="p-4 rounded-2xl flex gap-4 items-center">
-                     <div className="h-12 w-12 rounded-xl bg-[#F1F3EE] flex items-center justify-center">
-                       <Utensils className="h-5 w-5 text-[#5A6E4B]" />
-                     </div>
-                     <div>
-                       <p className="font-bold">{m.name}</p>
-                       <p className="text-xs text-[#8E8D8A]">{format(ensureDate(m.timestamp), 'MMM d, h:mm a')}</p>
-                     </div>
-                     <div className="ml-auto font-bold">{m.calories} cal</div>
-                   </Card>
+                   <div key={m.id}>
+                     <SwipeToDeleteItem isReadOnly={isPastDay} onDelete={() => deleteMeal(m.id)}>
+                       <Card className="p-4 rounded-2xl flex gap-4 items-center">
+                         <div className="h-12 w-12 rounded-xl bg-[#F1F3EE] flex items-center justify-center">
+                           <Utensils className="h-5 w-5 text-[#5A6E4B]" />
+                         </div>
+                         <div>
+                           <p className="font-bold">{m.name}</p>
+                           <p className="text-xs text-[#8E8D8A]">{format(ensureDate(m.timestamp), 'MMM d, h:mm a')}</p>
+                         </div>
+                         <div className="ml-auto font-bold">{m.calories} cal</div>
+                       </Card>
+                     </SwipeToDeleteItem>
+                   </div>
                  ))}
               </div>
             </div>
@@ -560,16 +746,20 @@ export default function Dashboard({ profile }: DashboardProps) {
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                  <p className="text-[#8E8D8A]">Viewing your workout sessions and activity milestones...</p>
                  {workouts.map(w => (
-                   <Card key={w.id} className="p-4 rounded-2xl flex gap-4 items-center">
-                     <div className="h-12 w-12 rounded-xl bg-[#F1F3EE] flex items-center justify-center">
-                       <Dumbbell className="h-5 w-5 text-[#5A6E4B]" />
-                     </div>
-                     <div>
-                       <p className="font-bold">{w.type}</p>
-                       <p className="text-xs text-[#8E8D8A]">{format(ensureDate(w.timestamp), 'MMM d, h:mm a')}</p>
-                     </div>
-                     <div className="ml-auto font-bold text-[#5A6E4B]">-{w.caloriesBurned} cal</div>
-                   </Card>
+                   <div key={w.id}>
+                     <SwipeToDeleteItem isReadOnly={isPastDay} onDelete={() => deleteWorkout(w.id)}>
+                       <Card className="p-4 rounded-2xl flex gap-4 items-center">
+                         <div className="h-12 w-12 rounded-xl bg-[#F1F3EE] flex items-center justify-center">
+                           <Dumbbell className="h-5 w-5 text-[#5A6E4B]" />
+                         </div>
+                         <div>
+                           <p className="font-bold">{w.type}</p>
+                           <p className="text-xs text-[#8E8D8A]">{format(ensureDate(w.timestamp), 'MMM d, h:mm a')}</p>
+                         </div>
+                         <div className="ml-auto font-bold text-[#5A6E4B]">-{w.caloriesBurned} cal</div>
+                       </Card>
+                     </SwipeToDeleteItem>
+                   </div>
                  ))}
               </div>
             </div>
@@ -666,13 +856,21 @@ export default function Dashboard({ profile }: DashboardProps) {
               </div>
 
               <div className="mt-auto pt-8 border-t border-[#E8E6E0]">
-                <div className="flex items-center gap-4 mb-8">
+                <div className="flex items-center gap-4 mb-4">
                   <div className="h-12 w-12 rounded-full bg-[#DCD9D1]" />
                   <div>
                     <p className="font-bold">{profile.name}</p>
                     <p className="text-xs text-[#8E8D8A]">Weight: {profile.weight} kg</p>
                   </div>
                 </div>
+                <Button 
+                  variant="ghost"
+                  className="w-full justify-start h-14 rounded-2xl text-[#8E8D8A] hover:bg-[#F8F7F2] font-bold gap-3 mb-2"
+                  onClick={() => { setShowGoalEditor(true); setIsMobileMenuOpen(false); }}
+                >
+                  <Target className="h-5 w-5" />
+                  My Goal
+                </Button>
                 <Button 
                   className="w-full h-14 rounded-2xl bg-[#E57373]/10 text-[#E57373] hover:bg-[#E57373]/20 font-bold gap-3"
                   onClick={() => auth.signOut()}
@@ -706,6 +904,13 @@ export default function Dashboard({ profile }: DashboardProps) {
             profile={profile}
             onClose={() => setShowStepTracker(false)}
             onLogged={() => fetchData(selectedDate)}
+          />
+        )}
+        {showGoalEditor && (
+          <GoalEditor
+            profile={profile}
+            onClose={() => setShowGoalEditor(false)}
+            onSave={(goalData) => setUserGoal(goalData)}
           />
         )}
       </AnimatePresence>
